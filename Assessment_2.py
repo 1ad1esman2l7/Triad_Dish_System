@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button, RadioButtons
 import roboticstoolbox as rtb 
 import copy
+from EmergencyStopGUI import EmergencyStopGUI
+import tkinter as tk
 
 
 
@@ -25,6 +27,55 @@ class Assessment_2():
         self.env = swift.Swift()
         self.env.launch(realtime=True, show_ground=False, show_grid=False)
         self.robot = None
+        
+        # Initialize E-stop system
+        self.emergency_gui = None
+        self.emergency_stop_active = False
+        
+        
+    def initialize_emergency_stop(self):
+        """Initialize the emergency stop GUI system"""
+        try:
+            self.emergency_gui = EmergencyStopGUI(self)
+            print("✅ Emergency Stop GUI initialized")
+            print("🛑 E-stop GUI is now active - use it to halt operations")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to initialize E-stop GUI: {e}")
+            self.emergency_gui = None
+
+    def check_emergency_stop(self):
+        """Check if emergency stop is active"""
+        if self.emergency_gui and self.emergency_gui.is_emergency_active():
+            return True
+        return False
+
+    def wait_for_emergency_clearance(self):
+        """Wait for emergency stop to be cleared"""
+        if self.emergency_gui and self.emergency_gui.is_emergency_active():
+            print("\n🛑 EMERGENCY STOP ACTIVE - Waiting for clearance...")
+            print("🛑 Use the E-stop GUI to request resume, then press Enter")
+            
+            while self.emergency_gui.is_emergency_active():
+                try:
+                    # Check if resume is requested
+                    if self.emergency_gui.resume_requested:
+                        print("🔄 Resume requested - Press Enter to confirm...")
+                        input("Press Enter to confirm system restart: ")
+                        
+                        if self.emergency_gui.confirm_resume():
+                            print("✅ Emergency stop cleared - resuming operations")
+                            break
+                        else:
+                            print("❌ Resume not confirmed - emergency stop still active")
+                    else:
+                        time.sleep(0.1)  # Wait for user action
+                except KeyboardInterrupt:
+                    print("🛑 System shutdown by user")
+                    return False
+            
+            return True
+        return True
 
 
     def addRobot(self, position=[0, 0, 0], rotation=[0, 0, 0]):
@@ -355,15 +406,25 @@ class Assessment_2():
             
             
     def execute_robot_movements(self, robot_index, target_poses, trajectory_steps=50, step_delay=0.05, 
-                        plate_mesh=None, attachment_events=None, attachment_offset=[0, 0, 0], obstacles=None):
+                    plate_mesh=None, attachment_events=None, attachment_offset=[0, 0, 0], obstacles=None):
         robot_names = ["ABB IRB 120", "myCobot280", "UR3"]
         
         print("Starting robot movement demonstration...")
         print(f"Controlling Robot {robot_index + 1} ({robot_names[robot_index]})")
         print(f"Planning {len(target_poses)} movements...")
         
+        # EMERGENCY STOP CHECK
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - Movement aborted!")
+            return
         
-
+        # EMERGENCY SAFETY CHECK
+        if robot_index == 1 and obstacles:
+            if not self.check_robot_safety(robot_index, obstacles):
+                print("🛑 EMERGENCY STOP: Robot is trapped or in dangerous position!")
+                print("🛑 ABORTING ALL MOVEMENTS for safety!")
+                return  # Exit the entire function
+        
         # Get the selected robot
         robot = self.robots[robot_index]
         
@@ -373,14 +434,56 @@ class Assessment_2():
 
         # Execute each target pose
         for movement_num, target_config in enumerate(target_poses):
+            # EMERGENCY STOP CHECK before each movement
+            if self.check_emergency_stop():
+                print("🛑 EMERGENCY STOP ACTIVE - Movement sequence aborted!")
+                return
+            
             print(f"\n--- Movement {movement_num + 1}/{len(target_poses)} ---")
             
             # Check for attachment events at start of movement
             for event_movement, action in attachment_events:
                 if event_movement == movement_num:
                     if action == 'attach' and plate_mesh and not plate_attached:
-                        self.attach_plate_to_robot(robot_index, plate_mesh, attachment_offset)
-                        plate_attached = True
+                        # CHECK IF PLATE IS ACCESSIBLE AND ROBOT IS CLOSE ENOUGH
+                        if robot_index == 1 and obstacles:  # Only for myCobot280 with collision avoidance
+                            # Get actual plate position from the plate mesh
+                            plate_transform = plate_mesh.T
+                            actual_plate_position = [plate_transform[0, 3], plate_transform[1, 3], plate_transform[2, 3]]
+                            
+                            print(f"🔍 CHECKING PLATE ACCESSIBILITY:")
+                            print(f"  Actual plate position: [{actual_plate_position[0]:.3f}, {actual_plate_position[1]:.3f}, {actual_plate_position[2]:.3f}]")
+                            
+                            # Check if plate is trapped in obstacles
+                            if self.check_plate_collision(actual_plate_position, obstacles):
+                                print("🛑 PLATE IS TRAPPED! Cannot attach plate - it's inside an obstacle!")
+                                print("🛑 COMPLETE SYSTEM SHUTDOWN - Plate attachment impossible!")
+                                print("🛑 ALL ROBOT MOVEMENTS FROZEN!")
+                                return  # Exit the entire function - FREEZE EVERYTHING
+                            
+                            # Check if robot is close enough to the plate (within 0.2m)
+                            robot_pos = robot.fkine(robot.q).t
+                            distance_to_plate = np.sqrt(
+                                (robot_pos[0] - actual_plate_position[0])**2 + 
+                                (robot_pos[1] - actual_plate_position[1])**2 + 
+                                (robot_pos[2] - actual_plate_position[2])**2
+                            )
+                            
+                            print(f"  Distance to plate: {distance_to_plate:.3f}m")
+                            
+                            if distance_to_plate > 0.2:  # 20cm threshold
+                                print(f"🛑 ROBOT TOO FAR FROM PLATE! Distance: {distance_to_plate:.3f}m (max: 0.2m)")
+                                print("🛑 COMPLETE SYSTEM SHUTDOWN - Robot cannot reach plate!")
+                                print("🛑 ALL ROBOT MOVEMENTS FROZEN!")
+                                return  # Exit the entire function - FREEZE EVERYTHING
+                            else:
+                                print("✅ Plate is accessible and robot is close enough, proceeding with attachment...")
+                                self.attach_plate_to_robot(robot_index, plate_mesh, attachment_offset)
+                                plate_attached = True
+                        else:
+                            # For other robots or no collision avoidance, proceed normally
+                            self.attach_plate_to_robot(robot_index, plate_mesh, attachment_offset)
+                            plate_attached = True
                     elif action == 'detach' and plate_mesh and plate_attached:
                         self.detach_plate_from_robot(plate_mesh)
                         plate_attached = False
@@ -388,8 +491,27 @@ class Assessment_2():
             # Parse target configuration
             x, y, z, roll, pitch, yaw = target_config
             target_pose = SE3(x, y, z) * SE3.RPY(roll, pitch, yaw, unit='deg')
-            
+
             print(f"Target pose: Position({x:.2f}, {y:.2f}, {z:.2f}), Orientation({roll}°, {pitch}°, {yaw}°)")
+
+            # Store plate position for collision checking
+            plate_position = [x, y, z]
+
+            # ADDITIONAL CHECK: If this is an attachment movement, verify robot can reach the plate
+            if robot_index == 1 and obstacles and plate_mesh:
+                actual_plate_pos = self.get_plate_position(plate_mesh)
+                if actual_plate_pos:
+                    robot_pos = robot.fkine(robot.q).t
+                    distance_to_plate = np.sqrt(
+                        (robot_pos[0] - actual_plate_pos[0])**2 + 
+                        (robot_pos[1] - actual_plate_pos[1])**2 + 
+                        (robot_pos[2] - actual_plate_pos[2])**2
+                    )
+                    print(f"🔍 PRE-MOVEMENT CHECK: Distance to plate: {distance_to_plate:.3f}m")
+                    
+                    if distance_to_plate > 0.2:
+                        print(f"⚠️ WARNING: Robot is {distance_to_plate:.3f}m from plate (max: 0.2m)")
+                        print("⚠️ This movement may not allow plate attachment!")
             
             # COLLISION AVOIDANCE: Only for myCobot280 (robot_index == 1)
             if robot_index == 1 and obstacles:
@@ -399,12 +521,21 @@ class Assessment_2():
                 trajectory_collision = self.check_trajectory_collision(robot, target_pose, obstacles)
                 
                 if trajectory_collision:
-                    print("❌ COLLISION DETECTED in trajectory! Adjusting path...")
-                    # Get a safe pose instead
+                    print("❌ COLLISION DETECTED in trajectory! Attempting to find safe route...")
+                    
+                    # Try to get a safe pose
                     safe_pose_config = self.get_safe_pose(target_config, obstacles)
-                    x, y, z, roll, pitch, yaw = safe_pose_config
-                    target_pose = SE3(x, y, z) * SE3.RPY(roll, pitch, yaw, unit='deg')
-                    print(f"✅ Using safe pose: Position({x:.2f}, {y:.2f}, {z:.2f})")
+                    
+                    if safe_pose_config is None:
+                        print("🛑 NO SAFE ROUTE AVAILABLE!")
+                        print("🛑 SYSTEM FREEZE - Cannot proceed safely!")
+                        self.emergency_system_freeze("No safe route available for robot movement")
+                        return  # This will never be reached due to freeze, but good practice
+                    else:
+                        # Use the safe pose
+                        x, y, z, roll, pitch, yaw = safe_pose_config
+                        target_pose = SE3(x, y, z) * SE3.RPY(roll, pitch, yaw, unit='deg')
+                        print(f"✅ Using safe pose: Position({x:.2f}, {y:.2f}, {z:.2f})")
                 else:
                     print("✅ Trajectory path is clear")
             
@@ -442,6 +573,18 @@ class Assessment_2():
             # Execute trajectory
             print("Executing movement...")
             for i, q in enumerate(trajectory.q):
+                # EMERGENCY STOP CHECK during movement
+                if self.check_emergency_stop():
+                    print("🛑 EMERGENCY STOP ACTIVATED DURING MOVEMENT!")
+                    print("🛑 Movement paused - waiting for clearance...")
+                    
+                    # Wait for emergency clearance
+                    if not self.wait_for_emergency_clearance():
+                        print("🛑 Movement aborted by user")
+                        return
+                    
+                    print("✅ Emergency stop cleared - resuming movement...")
+                
                 robot.q = q
                 self.env.step(0.05)
                 time.sleep(step_delay)
@@ -459,6 +602,89 @@ class Assessment_2():
 
         print("\n All movements completed!")
         
+    
+    def emergency_system_freeze(self, reason):
+        """Completely freeze all robot movements and system operations"""
+        print("\n" + "="*80)
+        print("🛑 EMERGENCY SYSTEM FREEZE ACTIVATED")
+        print("="*80)
+        print(f"🛑 REASON: {reason}")
+        print("🛑 ALL ROBOT MOVEMENTS STOPPED")
+        print("🛑 ALL SYSTEM OPERATIONS FROZEN")
+        print("🛑 MANUAL INTERVENTION REQUIRED")
+        print("="*80)
+        
+        # Stop all robot movements
+        for i, robot in enumerate(self.robots):
+            print(f"🛑 Robot {i+1} FROZEN at position: {robot.fkine(robot.q).t}")
+        
+        # Keep environment running but frozen
+        print("🛑 Environment remains active but all movements are frozen")
+        print("🛑 Use E-stop GUI to request resume, then press Enter")
+        
+        # Wait for emergency clearance
+        if not self.wait_for_emergency_clearance():
+            return
+    
+    def get_plate_position(self, plate_mesh):
+        """Get the actual position of the plate mesh"""
+        if plate_mesh is None:
+            return None
+        
+        try:
+            plate_transform = plate_mesh.T
+            return [plate_transform[0, 3], plate_transform[1, 3], plate_transform[2, 3]]
+        except:
+            return None
+        
+    def check_robot_safety(self, robot_index, obstacles):
+        """Check if robot can move safely and if plate is accessible"""
+        if robot_index != 1 or not obstacles:
+            return True  # No collision avoidance for other robots
+        
+        print("🔍 COMPREHENSIVE SAFETY CHECK:")
+        
+        # Check robot movement safety
+        current_pos = self.robots[1].fkine(self.robots[1].q).t
+        test_movements = [
+            [current_pos[0] + 0.5, current_pos[1], current_pos[2]],      # Move right
+            [current_pos[0] - 0.5, current_pos[1], current_pos[2]],      # Move left
+            [current_pos[0], current_pos[1] + 0.5, current_pos[2]],      # Move forward
+            [current_pos[0], current_pos[1] - 0.5, current_pos[2]],      # Move back
+            [current_pos[0], current_pos[1], current_pos[2] + 0.3],      # Move up
+        ]
+        
+        safe_movements = 0
+        for test_pos in test_movements:
+            try:
+                temp_robot = copy.deepcopy(self.robots[1])
+                target_pose = SE3(test_pos[0], test_pos[1], test_pos[2])
+                result = temp_robot.ikine_LM(target_pose, q0=temp_robot.q)
+                
+                if result.success:
+                    temp_robot.q = result.q
+                    if not self.check_collision_with_bounding_boxes(temp_robot, obstacles):
+                        safe_movements += 1
+            except:
+                pass
+        
+        if safe_movements == 0:
+            print("🛑 ROBOT IS TRAPPED! No safe movements available!")
+            return False
+        else:
+            print(f"✅ Robot has {safe_movements} safe movement options")
+        
+        # Check plate accessibility
+        plate_mesh = getattr(self, 'plate_mesh', None)
+        if plate_mesh:
+            actual_plate_pos = self.get_plate_position(plate_mesh)
+            if actual_plate_pos:
+                if self.check_plate_collision(actual_plate_pos, obstacles):
+                    print("🛑 PLATE IS TRAPPED! Cannot access plate!")
+                    return False
+                
+        
+        return True
         
     def check_trajectory_collision(self, robot, target_pose, obstacles):
         
@@ -529,6 +755,11 @@ class Assessment_2():
         print(f"Circle center: {center_position}")
         print(f"Circle radius: {radius}m")
         
+        # EMERGENCY STOP CHECK before starting
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - RMRC circle aborted!")
+            return
+        
         # STEP 1: Move robot to the desired circle center first
         print("Moving robot to circle center...")
         target_pose = SE3(center_position[0], center_position[1], center_position[2])
@@ -537,12 +768,23 @@ class Assessment_2():
             # Plan trajectory to circle center
             trajectory = rtb.jtraj(robot.q, result.q, 50)
             for q in trajectory.q:
+                # EMERGENCY STOP CHECK during movement to center
+                if self.check_emergency_stop():
+                    print("🛑 EMERGENCY STOP ACTIVATED DURING MOVEMENT TO CENTER!")
+                    print("🛑 Movement halted immediately!")
+                    return
+                    
                 robot.q = q
                 self.env.step(0.05)
                 time.sleep(0.05)
             print("✅ Robot moved to circle center")
         else:
             print("❌ Failed to move to circle center - using current position")
+        
+        # EMERGENCY STOP CHECK before starting circle
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - RMRC circle aborted!")
+            return
         
         # STEP 2: Now generate circle waypoints around the robot's current position
         x = np.zeros([3, steps])
@@ -566,6 +808,12 @@ class Assessment_2():
         
         # RMRC loop
         for i in range(steps - 1):
+            # EMERGENCY STOP CHECK during RMRC calculation
+            if self.check_emergency_stop():
+                print("🛑 EMERGENCY STOP ACTIVATED DURING RMRC CALCULATION!")
+                print("🛑 RMRC calculation halted immediately!")
+                return
+                
             xdot = (x[:, i + 1] - x[:, i]) / delta_t  # Cartesian velocity
             J = robot.jacob0(q_matrix[i, :])          # Full Jacobian at current joint config
             J_pos = J[:3, :]                         # Use only position part
@@ -579,6 +827,12 @@ class Assessment_2():
         # Animate in Swift
         print("Executing RMRC circle movement...")
         for i, q in enumerate(q_matrix):
+            # EMERGENCY STOP CHECK during circle execution
+            if self.check_emergency_stop():
+                print("🛑 EMERGENCY STOP ACTIVATED DURING CIRCLE EXECUTION!")
+                print("🛑 Circle execution halted immediately!")
+                return
+                
             robot.q = q
             ee_position = robot.fkine(q).A[:3, 3]
             
@@ -601,14 +855,58 @@ class Assessment_2():
                 'size': [1.0, 1.4, 5.0],       # [width, depth, height] - measure   actual shelf
                 'visible': True
             },
-            # {
-            #     'name': 'test_curtain', 
-            #     'position': [5.9, 1, 2.2],    # From   existing code
-            #     'size': [0.5, 1.0, 0.4],       
-            #     'visible': True
-            # }
+            {
+                'name': 'test_curtain', 
+                'position': [6.90, 1, 2.0],          # initial position of the curtain [5.9, 1, 2.2]
+                'size': [0.5, 1.0, 0.4],       
+                'visible': True
+            }
         ]
         return obstacles
+    
+    def check_plate_collision(self, plate_position, obstacles):
+        """Check if the plate is inside any bounding box"""
+        x, y, z = plate_position
+        
+        print(f"\n🔍 PLATE COLLISION CHECK:")
+        print(f"Plate position: [{x:.3f}, {y:.3f}, {z:.3f}]")
+        
+        for obstacle in obstacles:
+            pos = obstacle['position']  # Box center
+            size = obstacle['size']      # Box dimensions
+            
+            print(f"\nChecking plate against {obstacle['name']}:")
+            print(f"  Box center: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            print(f"  Box size: [{size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f}]")
+            
+            # Calculate box boundaries
+            x_min = pos[0] - size[0]/2
+            x_max = pos[0] + size[0]/2
+            y_min = pos[1] - size[1]/2
+            y_max = pos[1] + size[1]/2
+            z_min = pos[2] - size[2]/2
+            z_max = pos[2] + size[2]/2
+            
+            print(f"  X range: {x_min:.3f} to {x_max:.3f}")
+            print(f"  Y range: {y_min:.3f} to {y_max:.3f}")
+            print(f"  Z range: {z_min:.3f} to {z_max:.3f}")
+            
+            # Check if plate is inside the box
+            inside_x = x_min <= x <= x_max
+            inside_y = y_min <= y <= y_max
+            inside_z = z_min <= z <= z_max
+            
+            print(f"  Plate inside X: {inside_x} (Plate X: {x:.3f})")
+            print(f"  Plate inside Y: {inside_y} (Plate Y: {y:.3f})")
+            print(f"  Plate inside Z: {inside_z} (Plate Z: {z:.3f})")
+            
+            if inside_x and inside_y and inside_z:
+                print(f"  ❌ PLATE IS TRAPPED inside {obstacle['name']}!")
+                return True
+            else:
+                print(f"  ✅ Plate is free from {obstacle['name']}")
+        
+        return False
     
     def visualize_bounding_boxes(self, obstacles):
         bounding_box_objects = []
@@ -679,6 +977,7 @@ class Assessment_2():
     
     
     def get_safe_pose(self, target_pose, obstacles):
+        """Generate a safe intermediate pose by testing multiple random poses around robot"""
         x, y, z, roll, pitch, yaw = target_pose
         
         print(f"🔧 TESTING MULTIPLE RANDOM POSES for target: [{x:.2f}, {y:.2f}, {z:.2f}]")
@@ -761,9 +1060,9 @@ class Assessment_2():
             
             return best_pose
         else:
-            print("❌ NO VALID POSES FOUND! Using fallback position...")
-            # Fallback: move far away from obstacles
-            return [x + 2.0, y, z + 1.0, roll, pitch, yaw]
+            print("❌ NO VALID POSES FOUND! No collision-free routes available!")
+            print("🛑 ROBOT WILL STOP - No safe movement possible!")
+            return None  # Return None instead of fallback position
         
         
     def generate_smart_test_poses(self, current_pos, target_pos, num_poses=20):
@@ -800,6 +1099,26 @@ class Assessment_2():
     
 
     def run(self): 
+        # Initialize emergency stop system
+        self.initialize_emergency_stop()
+        
+        # Keep GUI responsive with periodic updates
+        print("✅ Emergency Stop GUI is active - use keyboard controls")
+        print("🛑 Press 'E' for emergency stop, 'R' for resume, 'C' to confirm")
+        
+        # Wait for emergency clearance if needed
+        if not self.wait_for_emergency_clearance():
+            return
+        
+        # Add periodic GUI update after initialization
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+        
+        # EMERGENCY STOP CHECK before robot creation
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - Robot creation aborted!")
+            return
+        
         # Define robot positions and rotations
         robot_configs = [
             {"position": [8, 0.5, 1.7], "rotation": [-90, 0, 0]},      # Robot 1 - Taj = inded 0
@@ -810,6 +1129,11 @@ class Assessment_2():
         self.robots = []
         robot_classes = [ABB_IRB_120_Cyl, myCobot280, UR3]
         for i, config in enumerate(robot_configs):
+            # EMERGENCY STOP CHECK during robot creation
+            if self.check_emergency_stop():
+                print("🛑 EMERGENCY STOP ACTIVE - Robot creation halted!")
+                return
+                
             # Select robot class (fall back to myCobot280 if index out of range)
             RobotClass = robot_classes[i] if i < len(robot_classes) else myCobot280
             robot = RobotClass()
@@ -828,6 +1152,14 @@ class Assessment_2():
             print(f"Added Robot {i+1} ({RobotClass.__name__}) at position {config['position']} with rotation {config['rotation']}")
         self.env.step(0.02)
         
+        # Add periodic GUI update after robot creation
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+        
+        # EMERGENCY STOP CHECK before environment setup
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - Environment setup aborted!")
+            return
         
         # Load the kitchen environment and furniture
         print("Loading kitchen environment...")
@@ -840,9 +1172,56 @@ class Assessment_2():
         print("Kitchen furniture added")
         self.env.step(0.02)
         
-        # Now demonstrate the advanced GUI for Robot 3 control with full environment
-        print("Environment fully loaded!")
+        # Add periodic GUI update after environment setup
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+            
+            
+        # input("Press Enter to continue show reach volume for all robots")
+        
+        # # Define different colors for each robot's reach volume
+        # robot_colors = [
+        #     [1.0, 0.0, 0.0, 1.0],  # Red for Robot 1 (ABB_IRB_120_Cyl)
+        #     [0.0, 1.0, 0.0, 1.0],  # Green for Robot 2 (myCobot280)
+        #     [0.0, 0.0, 1.0, 1.0],  # Blue for Robot 3 (UR3)
+        # ]
+        
+        # robot_names = ["ABB IRB 120", "myCobot280", "UR3"]
+        
+        # all_points = []
+        
+        # # Calculate and visualize reach volume for each robot
+        # for i, robot in enumerate(self.robots):
+        #     print(f"Calculating reach volume for {robot_names[i]} (Robot {i+1})...")
+            
+        #     # Calculate reach volume for this robot
+        #     reach_able_positions, bounds, max_reach = self.calculate_reach_volume(robot, num_samples=1000)
+            
+        #     print(f"Robot {i+1} ({robot_names[i]}) reach volume bounds:")
+        #     print(f"  X: {bounds['x'][0]:.2f} to {bounds['x'][1]:.2f}")
+        #     print(f"  Y: {bounds['y'][0]:.2f} to {bounds['y'][1]:.2f}")
+        #     print(f"  Z: {bounds['z'][0]:.2f} to {bounds['z'][1]:.2f}")
+        #     print(f"  Max reach: {max_reach:.2f}")
+            
+        #     # Visualize with robot-specific color
+        #     color = robot_colors[i] if i < len(robot_colors) else [0.5, 0.5, 0.5, 1.0]  # Default gray if more robots than colors
+        #     points = self.visualize_reach_volume(reach_able_positions, point_freq=20, color=color)
+        #     all_points.extend(points)
+            
+        #     print(f"Robot {i+1} reach volume visualization complete!")
+        # print(f"\nAll {len(self.robots)} robot reach volumes visualized with different colors:")
+        # for i, name in enumerate(robot_names):
+        #     color_name = ["Red", "Green", "Blue"][i] if i < 3 else "Gray"
+        #     print(f"  Robot {i+1} ({name}): {color_name}")
+        
+        
+        # input("Press Enter to continue to teach GUI")
         # self.demonstrate_robot_gui()
+        
+        # EMERGENCY STOP CHECK before obstacle setup
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - Obstacle setup aborted!")
+            return
         
         # Create obstacle bounding boxes
         obstacles = self.create_obstacle_bounding_boxes()
@@ -851,10 +1230,21 @@ class Assessment_2():
         print("Adding visible bounding boxes to environment...")
         bounding_box_objects = self.visualize_bounding_boxes(obstacles)
         self.env.step(0.02)  # Update environment to show boxes
-           
-           
-           
+        
+        # Add periodic GUI update after obstacle setup
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+        
+        # EMERGENCY STOP CHECK before washing demonstration
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - Washing demonstration aborted!")
+            return
+        
         print("Starting Washing demonstration...")
+
+        # Add this line after each major operation in your run method:
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
         
         # # First parameter is the robot index (0=ABB_IRB_120, 1=myCobot280, 2=UR3), second parameter is the sequence
         # self.execute_robot_movements(0, plate_sequence) 
@@ -895,9 +1285,24 @@ class Assessment_2():
                 obstacles=None      
             )
         
+        # Add periodic GUI update after first robot movement
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+        
+        # EMERGENCY STOP CHECK before RMRC circle
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - RMRC circle aborted!")
+            return
+        
         # RMRC Circle movement with Robot 2 (UR3)
         print("\n" + "="*50)
         print("Starting RMRC Circle demonstration...")
+        
+
+        
+        # Add this line after each major operation in your run method:
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
         
         # Circle parameters
         circle_center = [7.5, 1.00, 1.5]  # [x, y, z] center of circle, ur3 mount = [7.25, 0.5, 1.7]
@@ -913,9 +1318,29 @@ class Assessment_2():
             delta_t=0.05                    # Time step
         )
 
+        # Check if emergency stop was activated during RMRC circle
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - Skipping remaining operations!")
+            return
+
+        # Add periodic GUI update after RMRC circle
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+
+        # EMERGENCY STOP CHECK before UR3 movement
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - UR3 movement aborted!")
+            return
+
         # Jtraj to move UR3
         plate_mesh = getattr(self, 'plate_mesh', None)
-               
+        
+
+        
+        # Add periodic GUI update before UR3 movement
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+        
         # Define movement sequence
         plate_sequence = [
             [7.48, 1.00, 1.50, 0, 0, 0],      # Move to plate position = 0
@@ -948,10 +1373,42 @@ class Assessment_2():
                 obstacles=None   
             )
             
-    # Jtraj to move myCobot280
+        # Add periodic GUI update after UR3 movement
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+            
+        # EMERGENCY STOP CHECK before myCobot280 movement
+        if self.check_emergency_stop():
+            print("🛑 EMERGENCY STOP ACTIVE - myCobot280 movement aborted!")
+            return
+            
+        # Jtraj to move myCobot280
         plate_mesh = getattr(self, 'plate_mesh', None)
         
-               
+        # Add this line after each major operation in your run method:
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+
+        # CRITICAL SAFETY CHECK: Verify plate is accessible before starting
+        if plate_mesh and obstacles:
+            actual_plate_pos = self.get_plate_position(plate_mesh)
+            if actual_plate_pos:
+                print("🔍 PRE-MOVEMENT SAFETY CHECK:")
+                print(f"  Plate position: [{actual_plate_pos[0]:.3f}, {actual_plate_pos[1]:.3f}, {actual_plate_pos[2]:.3f}]")
+                
+                # Check if plate is trapped
+                if self.check_plate_collision(actual_plate_pos, obstacles):
+                    print("🛑 CRITICAL ERROR: Plate is trapped in obstacles!")
+                    self.emergency_system_freeze("Plate is trapped and cannot be accessed")
+                    return
+                
+                print("✅ Plate accessibility confirmed - proceeding with movement")
+        
+        # Add periodic GUI update after safety check
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
+        
+                
         # Define movement sequence
         plate_sequence = [
             [6.90, 1.00, 2.00, 0, 180, 0],      # Move to plate position = 0
@@ -984,6 +1441,10 @@ class Assessment_2():
                 attachment_offset=attachment_offset,
                 obstacles=obstacles   
             )
+        
+        # Add final periodic GUI update
+        if self.emergency_gui:
+            self.emergency_gui.update_gui()
 
 
 
