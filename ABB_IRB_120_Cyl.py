@@ -201,8 +201,9 @@ if __name__ == "__main__":
 #                             break
 #     return result
 
-#     input("Press enter to finish")
-#     env.close()
+    input("Press enter to finish")
+    env.close()
 
   
+
  
